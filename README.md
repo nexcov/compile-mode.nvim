@@ -1,12 +1,14 @@
-Small implementation of compile-mode from emacs in neovim.
-
-
-Set **CompileMode** command to any keybind:
+A small implementation of Emacs compile-mode for Neovim
 ``` lua
 {
     "nexcov/compile-mode.nvim",
     config = function()
-        vim.keymap.set('n', '<leader>cm', function() vim.cmd('CompileMode') end)
-    end
+        -- Opens the compile prompt
+        vim.keymap.set('n', '<leader>cm', function()
+            vim.cmd('CompileMode')
+        end)
+        -- Or run a command directly:
+        -- :CompileMode echo hi!
+    end,
 },
 ```
