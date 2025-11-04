@@ -1,286 +1,339 @@
-local Compile = {}
-Compile.__index = Compile
+CM_STATE = {
+    lastCmd = "",
+    instances = {},
+    maxInstances = 4,
+    nameSpace = vim.api.nvim_create_namespace("CompileModeNS")
+}
 
-local REG_GROUPS = '^(.*)[(:](%d+):(%d+)[:)]?'
-local REG_FORMAT = '^.*[(:]%d+:%d+[:)]?'
+vim.api.nvim_set_hl(0, 'CompilationGreen',     { fg = '#73d936', bg = nil  })
+vim.api.nvim_set_hl(0, 'CompilationRed',       { fg = '#f43841', bg = nil  })
+vim.api.nvim_set_hl(0, 'CompilationERROR',     { fg = '#f43841', bg = nil, underline = true })
+vim.api.nvim_set_hl(0, 'CompilationYellow',    { fg = '#ffdd33', bg = nil  })
+vim.api.nvim_set_hl(0, 'CompilationWARNING',   { fg = '#cc8c3c', bg = nil, underline = true })
+vim.api.nvim_set_hl(0, 'CompilationNOTE',      { fg = '#96a6c8', bg = nil, underline = true })
 
-Compile.CM_WIN_OPTS = { split = 'below'}
---TODO: Get errors list in a quickfix and get that list in the compilation buffer
+-- TODO:
+--       [t] Create a new filetype (or just a function) that parces the lines and set a mark to the founded fmt.
 
-local function handle_previous_running_instance(cm)
-    vim.ui.input({ prompt = "CMD is running, kill it? [Y]es, [N]o : ", default = "Y" },
-        function(input)
-            if not input then return end
-            input = input:lower()
-            if input == 'y' then
-                cm:kill_cmd(9) --SIGKILL
-                vim.api.nvim_buf_delete(cm.buf, { force = true })
-                vim.cmd('CompileMode')
-            elseif input == 'n' then
-                print("Not killed")
-            else
-                print("Invalid input expected Y or N")
-            end
-        end)
-end
+local WIN_OPTS = { split = 'below'}
+local SHELL_PATH = "/bin/bash"
 
-function Compile:new()
-    local cm = setmetatable({}, self)
-    if vim.g.compile_mode_ins ~= nil then
-        if vim.g.compile_mode_ins.cmd_running then
-            handle_previous_running_instance(vim.g.compile_mode_ins)
-            return nil
+local Instance = {}
+Instance.__index = Instance
+
+local DATE_FMT = "%d/%m/%y %H:%M:%S"
+local LUA_REGEX = "([^%[%]:%s%c]+):(%d+):(%d*):?"
+
+local function tableToString(t)
+    local result = ""
+    for _, item in ipairs(t) do
+        if (type(item) ~= 'table') then
+            result = result..item.." "
         else
-            vim.api.nvim_buf_delete(vim.g.compile_mode_ins.buf, { force = true })
+            result = result.."{"..tableToString(item).."} "
         end
     end
-    -- 1 index :(
-    cm.cur_error = 1
-    cm.errors = {}
-    cm.cmd_running = false
-    cm.cur_line = 0
-
-    -- WIN from cm was called
-    cm.mw = vim.api.nvim_get_current_win()
-    cm.ns = vim.api.nvim_create_namespace("CompileNS")
-
-    -- [[ BUFFER ]]
-    cm.buf = vim.api.nvim_create_buf(true, true)
-    vim.api.nvim_set_option_value("swapfile", false, { buf = cm.buf })
-    vim.api.nvim_set_option_value("buftype", "nofile", { buf = cm.buf })
-    vim.api.nvim_set_option_value("buflisted", true, { buf = cm.buf })
-    cm:set_keymaps()
-    cm:set_autocmds()
-    vim.g.compile_mode_ins = cm
-    return cm
+    return result
 end
 
-function Compile:set_keymaps()
-    vim.keymap.set('n', '<Esc>', function() vim.api.nvim_command('bd!') end, { buffer = self.buf, silent = true})
-    vim.keymap.set('n', 'q', function() vim.api.nvim_command('bd!') end, { buffer = self.buf, silent = true })
+function Instance:new(cmd)
+    local i = setmetatable({
+        buf = vim.api.nvim_create_buf(true, true),
+        cmd = cmd,
+        running = false,
+        marks = {},
+        stdout = vim.uv.new_pipe(true),
+        stderr = vim.uv.new_pipe(true),
+    }, self)
+    assert(i.buf ~= 0)
 
-    vim.keymap.set('n', '<CR>', function()
-        local l = vim.api.nvim_win_get_cursor(self.win)[1];
-        self:open_file(l)
-    end,  { buffer = self.buf , silent = true})
+    local name = string.format("%s *compilation* %s %.2f", cmd, os.date(DATE_FMT), os.clock())
+    vim.api.nvim_buf_set_name    (i.buf, name)
+    vim.api.nvim_set_option_value("swapfile",  false,    { buf = i.buf })
+    vim.api.nvim_set_option_value("buftype",   "nofile", { buf = i.buf })
+    vim.api.nvim_set_option_value("buflisted", true,     { buf = i.buf })
 
-    vim.keymap.set('n', '<C-v>', function()
-        local l = vim.api.nvim_win_get_cursor(self.win)[1];
-        self:open_file(l, 'vsplit')
-    end,  { buffer = self.buf , silent = true})
-
-    vim.keymap.set('n', '<leader>ne', function()
-        self:next_error()
-    end, { buffer = self.buf, silent = true })
-
-    vim.keymap.set('n', '<leader>pe', function()
-        self:prev_error()
-    end, { buffer = self.buf, silent = true })
-
-    vim.keymap.set({ 'n', 'i' }, '<C-c>', function() 
-        self:kill_cmd("SIG")
-    end, { buffer = self.buf, silent = true, noremap = false })
-end
-
-function Compile:set_autocmds()
-    vim.api.nvim_create_autocmd({ "BufDelete" }, {
-        group = "CompileMode",
-        buffer = self.buf,
-        callback = function()
-            if self.cmd_running then
-                vim.ui.input({ prompt = "CMD is running, kill it? [Y]es, [N]o : ", default = "Y" },
-                    function(input) 
-                        if not input then return end
-                        input = input:lower()
-                        if input == 'y' then
-                            self:kill_cmd(9) --SIGKILL
-                        elseif input == 'n' then
-                            print("Not killed")
-                        else
-                            print("Invalid input expected Y or N")
-                        end
-                    end)
-            end
-        end
-    })
-end
-
-function Compile:set_hl_marks(str, line, hl)
-    local file, row, col = str:match(REG_GROUPS)
-    vim.api.nvim_buf_set_extmark(self.buf, self.ns, line, 0, {
-        end_col = #file,
-        hl_group = hl,
-    })
-    -- file   :
-    vim.api.nvim_buf_set_extmark(self.buf, self.ns, line, #file + 1, {
-        end_col = #file + 1 + #row,
-        hl_group = "CompilationYellow",
-    })
-    -- file   :   row    :
-    vim.api.nvim_buf_set_extmark(self.buf, self.ns, line, #file + 1 + #row + 1, {
-        end_col = #file + 1 + #row + 1 +  #col,
-        hl_group = "CompilationGreen",
-    })
-
-    vim.api.nvim_buf_set_extmark(self.buf, self.ns, line, 0, {
-        end_col = #file + 1 + #row + 1 +  #col,
-        hl_group = "Underline"
-    })
-end
-
-function Compile:handle_line(data)
-    -- Cant use '\n' symbol in buf_set_lines
-    local lines = vim.split(data, '\n')
-    for _, v in ipairs(lines) do
-        if v ~= '' then
-            vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { v })
-            self.cur_line = self.cur_line + 1
-            if vim.api.nvim_get_current_win() == self.win then
-                vim.api.nvim_win_set_cursor(self.win, { self.cur_line + 1, 0 })
-            end
-
-            -- Search for file:row:col format
-            local fmt = v:match(REG_FORMAT)
-            if fmt then
-                table.insert(self.errors, self.cur_line + 1)
-                local hl = "CompilationRed"
-                local low = v:lower()
-
-                if low:match("warning") then
-                    hl = "CompilationBrown"
-                elseif low:match("note") then
-                    hl = "CopilationGreen"
+    vim.keymap.set('n', '<CR>',
+    function()
+        local row = vim.api.nvim_win_get_cursor(0)[1]
+        local s = {row - 1, 0 }
+        local e = {row - 1, #vim.api.nvim_get_current_line() }
+        local emks = vim.api.nvim_buf_get_extmarks(i.buf, CM_STATE.nameSpace, s, e, { overlap = true, details = true })
+        if #emks >= 4 then
+            for _, m in ipairs(emks) do
+                local found = i.marks[m[1]]
+                if found ~= nil then
+                    i:open_mark(m[1])
+                    break
                 end
-
-                self:set_hl_marks(fmt, self.cur_line, hl)
             end
+        end
+    end,
+    { buffer = i.buf , silent = true})
+
+    vim.keymap.set('n', '<C-c>',
+    function()
+        i:kill_cmd()
+    end,
+    { buffer = i.buf , silent = true})
+
+    table.insert(CM_STATE.instances, i)
+
+    local l = #CM_STATE.instances
+    vim.api.nvim_create_autocmd("BufUnload", {
+        buffer = i.buf,
+        callback = function()
+            i:kill_cmd()
+        end
+    })
+    return i
+end
+
+local function get_next_win_id(current)
+    local wins = vim.api.nvim_list_wins()
+    for i, win_id in ipairs(wins) do
+        if win_id == current then
+            return wins[(i % #wins) + 1]
         end
     end
 end
 
-function Compile:open_file(line, mode)
-    local str_l = vim.api.nvim_buf_get_lines(self.buf, line - 1, line, false)
-    local format = str_l[1]:match(REG_FORMAT)
-    if format then
-        local file, row, col = format:match(REG_GROUPS)
-        -- Dont know if this is slow
-        file = file:gsub("^[^%w./]+", ""):gsub("$[^%w]+", "")
-        if mode then
-            vim.api.nvim_command(mode..'| e '..file)
-        else
-            if (vim.api.nvim_win_is_valid(self.mw)) then
-                vim.api.nvim_set_current_win(self.mw)
-                vim.api.nvim_command('e '..file)
-            else
-                vim.api.nvim_command('vsplit | e'..file)
-            end
-        end
-        vim.fn.cursor(row, col)
-    end
-end
-
-function Compile:next_error()
-    if self.cur_error + 1 < #self.errors + 1 then
-        self.cur_error = self.cur_error + 1
+function Instance:open_mark(key)
+    local found = self.marks[key]
+    assert(found ~= nil)
+    local current = vim.api.nvim_get_current_win()
+    local next = get_next_win_id(current)
+    local extra = ''
+    if (next ~= current) then
+        vim.api.nvim_set_current_win(next)
     else
-        self.cur_error = 1
+        extra = extra.."split | "
     end
-    local row =  self.errors[self.cur_error]
-    vim.fn.cursor(row, 0)
-    self:open_file(row)
+    vim.api.nvim_command(extra..'e '..found.file)
+    vim.fn.cursor(found.row, found.col)
 end
 
-function Compile:prev_error()
-    if self.cur_error - 1 < 1 then
-        self.cur_error = #self.errors
-    else
-        self.cur_error = self.cur_error - 1
+local function get_exit_msg(code, signal)
+    local r = "Compilation"
+    if signal == 11 then
+        return r.." segmentation fault"
     end
-    local row =  self.errors[self.cur_error]
-    vim.fn.cursor(row, 0)
-    self:open_file(row)
-end
 
-function Compile:handle_exit_code(code)
-    if not code or not vim.api.nvim_buf_is_valid(self.buf) then return end
-    local comp = "Compilation"
-    local fin = " finished"
-    local l = vim.api.nvim_buf_line_count(self.buf) + 1
     if code ~= 0 then
-        local ab = " abnormaly "
-        vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { 
-            "",
-            comp..fin..ab..'with code '..code..' at '..os.date()
-        })
-        vim.api.nvim_buf_set_extmark(self.buf, self.ns, l, #comp + #fin, {
-            end_col = #comp + #fin + #ab,
-            hl_group = "CompilationRed",
-        })
-        vim.api.nvim_buf_set_extmark(self.buf, self.ns, l, #comp + #fin + #ab + 10, {
-            end_col = #comp + #fin + #ab + 10 +  #tostring(code),
-            hl_group = "CompilationRed",
-        })
+        r = r.." exited abnormaly with code "..code
+    else 
+        r = r.." finished"
+    end
+    return r
+end
 
-        vim.notify("Compilation exit with code: "..code, vim.log.levels.ERROR)
-    else
-        vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { 
-            "",
-            comp..fin..' at '..os.date()
-        })
-        vim.api.nvim_buf_set_extmark(self.buf, self.ns, l, #comp, {
-            end_col = #comp + #fin,
-            hl_group = "CompilationGreen",
-        })
+function Instance:on_exit_cmd(code, signal)
+    self.running = false
+    self.stdout:close()
+    self.stderr:close()
 
-        vim.notify("Compilation exit with code: "..code, vim.log.levels.INFO)
+    local date  = os.date(DATE_FMT)
+    local first = string.format("%s at %s", get_exit_msg(code, signal), date)
+    local duration = (vim.uv.now() - self.start) / 1000
+    local msg   = first..string.format(" duration (%.4f s)", duration)
+
+    local level = (code == 0 or signal ~= 11) and vim.log.levels.INFO or vim.log.levels.ERROR
+
+    vim.schedule(function()
+        if (vim.api.nvim_buf_is_valid(self.buf)) then 
+            vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { '' })
+            vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { msg })
+            local lines = vim.api.nvim_buf_line_count(self.buf) - 1
+            if (code == 0) then
+                vim.notify(first, vim.log.levels.INFO)
+                self:pattern_hl(msg, lines, "finished", "CompilationGreen")
+                self:pattern_hl(msg, lines, "segmentation fault", "CompilationRed")
+            else
+                vim.notify(first, vim.log.levels.ERROR)
+                self:pattern_hl(msg, lines, "exited abnormaly", "CompilationRed")
+                if vim.api.nvim_get_current_buf() == self.buf then
+                    vim.api.nvim_win_set_cursor(0, { lines, 0 })
+                end
+            end
+        end
+    end)
+end
+
+local function get_hl_level(line)
+    line = line:lower()
+    if line:match("error") then
+        return "CompilationERROR"
+    elseif line:match("warning") then
+        return "CompilationWARNING"
+    elseif line:match("note") then
+        return "CompilationNOTE"
+    else 
+        return "CompilationERROR"
     end
 end
 
-function Compile:call_cmd(cmd)
-    self.cmd_running = true
-    vim.api.nvim_buf_set_name(self.buf, "*compilation* '"..cmd.."'")
-    self.stdout = vim.uv.new_pipe()
-    self.stderr = vim.uv.new_pipe()
-    self.handle, self.pid = vim.uv.spawn('bash', {
-        args = { '-c', cmd },
+function Instance:index_hl(i, s, e, hl)
+        vim.api.nvim_buf_set_extmark(self.buf, CM_STATE.nameSpace, i, s - 1, {
+            end_col = e,
+            hl_group = hl
+        })
+end
+
+function Instance:pattern_hl(line, i, pattern, hl)
+    local s, e = line:find(pattern, 1, true);
+    if (e and s and e - s > 0) then
+        vim.api.nvim_buf_set_extmark(self.buf, CM_STATE.nameSpace, i, s - 1, {
+            end_col = e,
+            hl_group = hl
+        })
+    end
+    return s, e
+end
+
+function Instance:parse_line(line, i)
+    local file, row, col = line:match(LUA_REGEX)
+    if file and row then
+        local s, e = self:pattern_hl(line, i, file, get_hl_level(line)) -- file
+        e = e + 2
+        self:index_hl(i, e, e + #row - 1, "CompilationYellow") -- row
+        e = e + #row + 1
+        self:index_hl(i, e, e + #col - 1, "CompilationGreen") -- col
+
+        self.marks[vim.api.nvim_buf_set_extmark(self.buf, CM_STATE.nameSpace, i, 0, { end_col = #line })] = {
+            file = file, row = tonumber(row), col = tonumber(col) or 0
+        }
+    end
+end
+
+-- TODO: This wil be slow for big lines
+local function split_lines(data)
+    local lines = {}
+    local token = ''
+    for i = 1, #data do
+        local ch = data:sub(i, i)
+        if ch ~= '\n' then
+            token = token..ch
+        else
+            table.insert(lines, token)
+            token = ''
+        end
+    end
+    return lines
+end
+
+function Instance:put_line(data)
+    local lines = split_lines(data)
+    for _, line in ipairs(lines) do
+        local l = vim.api.nvim_buf_line_count(self.buf)
+        vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { line })
+        self:parse_line(line, l)
+        if vim.api.nvim_get_current_buf() == self.buf then
+            vim.fn.cursor(l, 0)
+        end
+    end
+end
+
+function Instance:run_cmd()
+    local msg = "Compilation started at "..os.date(DATE_FMT)
+    vim.api.nvim_buf_set_lines(self.buf, 0, 0, false, { msg })
+    vim.api.nvim_buf_set_lines(self.buf, -1, -1, false, { self.cmd, "" })
+    self:pattern_hl(msg, 0, "started", "CompilationGreen")
+    self.start = vim.uv.now()
+    self.lines = 5
+    self.handle, self.pid = vim.uv.spawn(SHELL_PATH, {
+        args = { "-c", self.cmd },
         cwd = vim.uv.cwd(),
         stdio = { nil, self.stdout, self.stderr },
     },
-        function(code, signal)
-            -- ON cmd exit
-            vim.schedule(function()
-                self.stdout:close()
-                self.stderr:close()
-                self:handle_exit_code(code)
-                self.cmd_running = false
-                if vim.api.nvim_get_current_win() == self.win then
-                    vim.cmd('normal G')
-                end
-            end)
-        end)
+    function(code, signal)
+        self:on_exit_cmd(code, signal)
+    end)
+
+    assert(self.handle ~= nil)
 
     self.stdout:read_start(function(err, data)
         assert(not err, err)
         if data then
-            vim.schedule(function() self:handle_line(data) end)
+            vim.schedule(function()
+                self:put_line(data)
+            end)
         end
     end)
 
     self.stderr:read_start(function(err, data)
         assert(not err, err)
         if data then
-            vim.schedule(function() self:handle_line(data) end)
+            vim.schedule(function()
+                self:put_line(data)
+            end)
         end
     end)
 end
 
-function Compile:kill_cmd(signal)
-    if not self.handle or not self.pid then return end
-    if self.cmd_running then
-        self.handle:kill(signal)
-    else
-        vim.notify("Process is not running", vim.log.levels.ERROR)
+function Instance:kill_cmd()
+    if (self.handle ~= nil) then
+        vim.uv.process_kill(self.handle, "sigint")
     end
 end
 
-return Compile
+local function find_buf(buf)
+    local wins = vim.api.nvim_list_wins()
+    local result = {}
+    for _, win in ipairs(wins) do
+        local wb = vim.api.nvim_win_get_buf(win);
+        if wb == buf then
+            table.insert(result, win)
+        end
+    end
+    return result
+end
+
+function compile_mode(cmd)
+    local new = Instance:new(cmd)
+
+    if #CM_STATE.instances > CM_STATE.maxInstances then
+        for _, instance in ipairs(CM_STATE.instances) do
+            if not instance.running then
+                local toRemove = CM_STATE.instances[1]
+                toRemove:kill_cmd()
+                if vim.api.nvim_buf_is_valid(toRemove.buf) then
+                    vim.api.nvim_buf_delete(toRemove.buf, { force = true })
+                end
+                table.remove(CM_STATE.instances, 1)
+                break
+            end
+        end
+    end
+
+    for i, instance in ipairs(CM_STATE.instances) do
+        local win = find_buf(instance.buf)
+        if #win > 0 then
+            vim.api.nvim_win_set_buf(win[1], new.buf)
+            instance:kill_cmd()
+            instance = new
+            vim.api.nvim_set_current_win(win[1])
+            goto exit;
+        end
+    end
+
+    vim.api.nvim_open_win(new.buf, true, WIN_OPTS)
+
+    ::exit::
+    new:run_cmd()
+end
+
+vim.api.nvim_create_user_command('CompileMode', 
+    function(opt)
+        if (#opt.args > 0)  then
+            local input = opt.args
+            compile_mode(input)
+            CM_STATE.lastCmd = input
+        else
+            vim.ui.input({ prompt = 'Compile cmd: ', default = CM_STATE.lastCmd },
+            function(input)
+                if not input then return end
+                compile_mode(input)
+                CM_STATE.lastCmd = input
+            end)
+        end
+    end, { nargs = '*' })
